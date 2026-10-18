@@ -11,6 +11,7 @@ import { ExportStudio } from './exportStudio.js';
 import { toast, askText } from './toast.js';
 import { kvGet, kvSet } from './store.js';
 import { saveFile, platformName, setDirty } from '../platform.js';
+import { mountAiStems } from './aiStems.js';
 
 const LETTERS = ['A', 'B', 'C', 'D'];
 const DECK_COLORS = ['red', 'gold', 'green', 'blue'];
@@ -546,6 +547,7 @@ export class App {
       return b;
     });
     ui.aiSlot = h('div', 'ai-slot', row3);
+    mountAiStems(ui.aiSlot, deck, this.engine); // desktop: high-quality AI separation
     const vol = h('div', 'vol-box', row3);
     h('span', 'grp-label', vol, 'VOLUME');
     ui.vol = new HSlider(vol, { min: 0, max: 1, def: 0.8, value: 0.8, persist: false, cls: 'vol',

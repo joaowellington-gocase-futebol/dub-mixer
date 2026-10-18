@@ -6,7 +6,7 @@ Mesa de mixagem dub / reggae / sound system para **macOS, Windows e Android**, c
 
 - **4 abas, sem rolar a tela**: MÚSICAS (decks + efeitos rápidos), MIXER, EFEITOS (sirene, eco, reverb, phaser) e SONS.
 - **Tudo em português**, com explicação ao passar o mouse e um botão **AJUDA** com guia rápido.
-- **Linha SEPARAR em cada deck**: TUDO / SEM VOZ / SÓ VOZ / SÓ BATIDA, mais o volume do deck.
+- **Linha SEPARAR em cada deck**: TUDO / SEM VOZ / SÓ VOZ / SÓ BATIDA, mais o volume do deck. No computador, o botão **VOZ COM IA** separa a voz com inteligência artificial (veja "Modo IA" abaixo).
 - **Barra EFEITOS LIGADOS**: mostra todo efeito ativo (eco, reverb, sirene, filtros, voz tirada, repetição…) com o tempo ligado; clique para desligar ou use **■ PARAR TUDO**. A **LINHA DO TEMPO** mostra o que foi usado no último minuto.
 - **Mesa dos sons**: botões giratórios de volume, eco e reverb para a buzina, tiro, laser e seus samples, e volume, eco e FINAL da sirene, mais **■ CORTAR SONS**.
 
@@ -83,7 +83,28 @@ A separação é feita por DSP em tempo real (STFT + separação harmônico/perc
 Limitações honestas desse método:
 - Funciona melhor em músicas **estéreo**; vozes centralizadas saem bem, mas instrumentos também centralizados podem vazar para o stem de voz.
 - O grave do **bumbo** tende a ir junto com o stem de BAIXO.
-- Não chega na qualidade de separadores por IA (Demucs/Spleeter). Uma evolução natural é adicionar um modo "IA" offline no desktop.
+- Não chega na qualidade de separadores por IA (Demucs/Spleeter) — para isso existe o modo IA abaixo.
+
+### Modo IA (Mac e Windows)
+
+No app de computador, cada deck tem o botão **VOZ COM IA** na linha SEPARAR. Ele separa a música inteira com o modelo **HT-Demucs** (ONNX Runtime, roda no próprio computador, sem internet depois do primeiro uso) e mostra o progresso com botão de cancelar. Depois os botões TUDO / SEM VOZ / SÓ VOZ / SÓ BATIDA e os knobs de stems usam o resultado; o botão vira **MODO IA** (clique para alternar com o modo em tempo real).
+
+- Na primeira vez baixa o modelo (166 MB) para a pasta de dados do app (`~/Library/Application Support/DUB-MIXER/models` no Mac, `%APPDATA%\DUB-MIXER\models` no Windows).
+- Leva cerca de 1 a 3 minutos por música (≈ 0,6–1,6 × a duração num Mac M1) e usa ~2,5 GB de RAM enquanto processa, num processo separado.
+- O stem RESTO é calculado como música − voz − bateria − baixo, então com tudo no máximo o som continua idêntico ao original.
+- No Android o app continua só com a separação em tempo real.
+
+Medição (`npm run dev` → `http://localhost:5199/tests/stemtest.html`, quanto o kill remove o alvo, dB, maior = melhor):
+
+| música de teste | kill | tempo real (DSP) | IA |
+|---|---|---|---|
+| riddim + voz real | VOZ | 5,0 | 17,1 |
+| riddim + voz real | BATERIA | −1,1 | 14,3 |
+| riddim + voz real | BAIXO | 16,0 | 30,0 |
+| riddim demo | BATERIA | −0,1 | 16,8 |
+| riddim demo | BAIXO | 16,9 | 34,0 |
+
+(O "vocal" do riddim demo é um sintetizador, que a IA classifica como RESTO, não como voz.)
 
 ## Estrutura
 

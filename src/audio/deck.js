@@ -1,8 +1,19 @@
 // DUB-MIXER deck + channel strip: playback, cues, loops, rewind/brake, stems, EQ, big-knob filter, sends.
 import { dbToGain } from './fx.js';
+import { separateBuffer } from './ai.js';
 
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 export const STEM_NAMES = ['VOCAL', 'DRUMS', 'BASS', 'OTHER'];
+// Latency of the DSP stem worklet (N + LA*H samples). The AI path is delayed by the same amount
+// so a deck keeps its timing when switching modes and stays in sync with the other decks.
+export const STEM_LATENCY = 3072;
+
+// AI mode plays the original mix + vocal/drums/bass stems; OTHER is the residual
+// (mix - vocal - drums - bass), so at unity it reconstructs the original exactly.
+// gains = effective [vocal, drums, bass, other] -> source gains [mix, vocal, drums, bass]
+export function aiSourceGains(g) {
+  return [g[3], g[0] - g[3], g[1] - g[3], g[2] - g[3]];
+}
 
 export class Deck {
   constructor(engine, index) {
@@ -58,6 +69,17 @@ export class Deck {
     this.meter = ctx.createAnalyser();
     this.meter.fftSize = 1024;
 
+    // AI stems path (desktop): mix + stem sources -> gains -> latency match -> trim
+    this.ai = null;          // { vocal, drums, bass } AudioBuffers for this.buffer
+    this.aiOn = false;
+    this.aiJob = null;       // { stage, p, cancel }
+    this.stemSrcs = [];
+    this.aiBus = ctx.createGain();
+    this.aiDelay = ctx.createDelay(1);
+    this.aiDelay.delayTime.value = STEM_LATENCY / ctx.sampleRate;
+    this.aiGains = [0, 1, 2, 3].map(() => { const g = ctx.createGain(); g.connect(this.aiBus); return g; });
+    this.aiBus.connect(this.aiDelay).connect(this.trim);
+
     this.srcBus.connect(this.splitter).connect(this.trim).connect(this.hpf).connect(this.lpf)
       .connect(this.eqLow).connect(this.eqMid).connect(this.eqHigh)
       .connect(this.pan).connect(this.fader).connect(this.muteGain);
@@ -80,6 +102,7 @@ export class Deck {
   // ------------------------------------------------------------ loading
   load(buffer, meta = {}) {
     this.stop(true);
+    this._dropAi();
     this.buffer = buffer;
     this.meta = { name: meta.name || 'Untitled', ...meta };
     this.pos = 0;
@@ -92,6 +115,7 @@ export class Deck {
   }
   eject() {
     this.stop(true);
+    this._dropAi();
     this.buffer = null;
     this.meta = null;
     this.peaks = null;
@@ -113,21 +137,32 @@ export class Deck {
 
   _startSource(offset, when = 0) {
     const ctx = this.ctx;
-    const src = ctx.createBufferSource();
-    src.buffer = this.buffer;
-    src.playbackRate.value = this.rate;
-    if (this.loop) {
-      src.loop = true;
-      src.loopStart = this.loop.start;
-      src.loopEnd = this.loop.end;
-    }
-    src.connect(this.srcBus);
     const t = Math.max(ctx.currentTime, when || ctx.currentTime);
-    src.start(t, clamp(offset, 0, Math.max(0, this.duration - 0.001)));
+    const off = clamp(offset, 0, Math.max(0, this.duration - 0.001));
+    const make = (buffer, dest) => {
+      const s = ctx.createBufferSource();
+      s.buffer = buffer;
+      s.playbackRate.value = this.rate;
+      if (this.loop) {
+        s.loop = true;
+        s.loopStart = this.loop.start;
+        s.loopEnd = this.loop.end;
+      }
+      s._dest = dest;
+      s.connect(dest);
+      s.start(t, off);
+      return s;
+    };
+    const useAi = this.aiOn && this.ai;
+    const src = make(this.buffer, useAi ? this.aiGains[0] : this.srcBus);
+    this.stemSrcs = useAi
+      ? [this.ai.vocal, this.ai.drums, this.ai.bass].map((b, k) => make(b, this.aiGains[k + 1]))
+      : [];
     src.onended = () => {
       if (this.src !== src) return;
       this.playing = false;
       this.src = null;
+      this.stemSrcs = [];
       this.pos = 0;
       this.engine.emit('deck-state', this);
     };
@@ -136,22 +171,27 @@ export class Deck {
     this.startOff = offset;
   }
 
+  _allSrcs() { return this.src ? [this.src, ...this.stemSrcs] : []; }
+
   _killSource(fade = 0.006) {
-    const s = this.src;
-    if (!s) return;
+    const all = this._allSrcs();
+    if (!all.length) return;
     this.src = null;
-    s.onended = null;
-    // tiny de-click fade on the bus
+    this.stemSrcs = [];
+    // tiny de-click fade (same ramp on every source so the AI stems stay complementary)
     const now = this.ctx.currentTime;
-    const g = this.ctx.createGain();
-    try {
-      s.disconnect();
-      s.connect(g).connect(this.srcBus);
-      g.gain.setValueAtTime(1, now);
-      g.gain.linearRampToValueAtTime(0, now + fade);
-      s.stop(now + fade + 0.002);
-      s.onended = () => g.disconnect();
-    } catch (e) { /* already stopped */ }
+    for (const s of all) {
+      s.onended = null;
+      const g = this.ctx.createGain();
+      try {
+        s.disconnect();
+        s.connect(g).connect(s._dest || this.srcBus);
+        g.gain.setValueAtTime(1, now);
+        g.gain.linearRampToValueAtTime(0, now + fade);
+        s.stop(now + fade + 0.002);
+        s.onended = () => g.disconnect();
+      } catch (e) { /* already stopped */ }
+    }
   }
 
   play() {
@@ -219,7 +259,7 @@ export class Deck {
       const p = this.position;
       this.startOff = p;
       this.startCtx = this.ctx.currentTime;
-      this.src.playbackRate.setValueAtTime(r, this.ctx.currentTime);
+      for (const s of this._allSrcs()) s.playbackRate.setValueAtTime(r, this.ctx.currentTime);
     }
     this.rate = r;
     this.engine.emit('deck-rate', this);
@@ -250,9 +290,11 @@ export class Deck {
     if (this.playing && this.src) {
       this.startOff = p;
       this.startCtx = this.ctx.currentTime;
-      this.src.loopStart = start;
-      this.src.loopEnd = end;
-      this.src.loop = true;
+      for (const s of this._allSrcs()) {
+        s.loopStart = start;
+        s.loopEnd = end;
+        s.loop = true;
+      }
       if (p > end || p < start) this.seek(start);
     }
     this.engine.emit('deck-state', this);
@@ -262,7 +304,7 @@ export class Deck {
     const p = this.position;
     this.loop = null;
     if (this.playing && this.src) {
-      this.src.loop = false;
+      for (const s of this._allSrcs()) s.loop = false;
       this.startOff = p;
       this.startCtx = this.ctx.currentTime;
     }
@@ -274,10 +316,11 @@ export class Deck {
     if (!this.playing || !this.src || this.busyFx) return;
     const now = this.ctx.currentTime;
     const p = this.position;
-    const s = this.src;
-    s.playbackRate.cancelScheduledValues(now);
-    s.playbackRate.setValueAtTime(this.rate, now);
-    s.playbackRate.linearRampToValueAtTime(0.001, now + time);
+    for (const s of this._allSrcs()) {
+      s.playbackRate.cancelScheduledValues(now);
+      s.playbackRate.setValueAtTime(this.rate, now);
+      s.playbackRate.linearRampToValueAtTime(0.001, now + time);
+    }
     this.busyFx = true;
     this._fxTimer = setTimeout(() => {
       this._fxTimer = null;
@@ -363,6 +406,62 @@ export class Deck {
   _sendStems() {
     const gains = this.stemGains.map((g, i) => (this.stemKill[i] ? 0 : g));
     this.splitter.port.postMessage({ gains });
+    const now = this.ctx.currentTime;
+    aiSourceGains(gains).forEach((v, k) => this.aiGains[k].gain.setTargetAtTime(v, now, 0.01));
+  }
+
+  // ------------------------------------------------------------ AI stems (desktop)
+  // Separate the loaded track with htdemucs, then switch this deck to the AI stems.
+  async runAi() {
+    if (!this.buffer || this.aiJob) return;
+    if (this.ai) { this.setAiMode(true); return; }
+    const buffer = this.buffer;
+    const job = separateBuffer(this.ctx, buffer, ({ stage, p }) => {
+      if (this.aiJob !== state) return;
+      state.stage = stage;
+      state.p = p;
+      this.engine.emit('deck-ai', this);
+    });
+    const state = { stage: 'queued', p: 0, cancel: job.cancel };
+    this.aiJob = state;
+    this.engine.emit('deck-ai', this);
+    try {
+      const stems = await job.promise;
+      if (this.aiJob !== state || this.buffer !== buffer) return;
+      this.aiJob = null;
+      this.ai = stems;
+      this.setAiMode(true);
+      this.engine.emit('deck-ai-done', this);
+    } catch (e) {
+      if (this.aiJob !== state) return;
+      this.aiJob = null;
+      this.engine.emit('deck-ai', this);
+      if (!e.canceled) this.engine.emit('deck-ai-error', { deck: this, error: e });
+    }
+  }
+  cancelAi() {
+    const j = this.aiJob;
+    if (!j) return;
+    this.aiJob = null;
+    j.cancel();
+    this.engine.emit('deck-ai', this);
+  }
+  // on = play the AI stems (if separated), off = real-time DSP splitter
+  setAiMode(on) {
+    on = !!on && !!this.ai;
+    if (on === this.aiOn) return;
+    this.aiOn = on;
+    if (this.playing && this.src && !this.busyFx) {
+      const p = this.position;
+      this._killSource();
+      this._startSource(p);
+    }
+    this.engine.emit('deck-ai', this);
+  }
+  _dropAi() {
+    if (this.aiJob) { const j = this.aiJob; this.aiJob = null; j.cancel(); }
+    this.ai = null;
+    this.aiOn = false;
   }
 
   // ------------------------------------------------------------ channel strip
