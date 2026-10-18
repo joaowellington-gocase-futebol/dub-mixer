@@ -1,0 +1,9 @@
+{
+  "appId": "com.dubmixer.studio",
+  "appName": "DUB-MIXER",
+  "webDir": "dist",
+  "android": {
+    "allowMixedContent": false,
+    "webContentsDebuggingEnabled": false
+  }
+}
